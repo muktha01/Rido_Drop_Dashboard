@@ -1,6 +1,6 @@
 {
-  "buildCommand": "npm install --prefix Ridodrop-Dashboard && npm run build --prefix Ridodrop-Dashboard",
-  "outputDirectory": "Ridodrop-Dashboard/dist",
-  "installCommand": "npm install --prefix Ridodrop-Dashboard",
-  "framework": null
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "installCommand": "npm install",
+  "rootDirectory": "Ridodrop-Dashboard"
 }
