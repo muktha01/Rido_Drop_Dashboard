@@ -1,0 +1,997 @@
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Box,
+  Card,
+  CardContent,
+  Typography,
+  CircularProgress,
+  Alert,
+  Grid,
+  Chip,
+  Avatar,
+  TextField,
+  MenuItem,
+  IconButton,
+  Tooltip,
+  Badge,
+  Divider,
+  Paper
+} from '@mui/material';
+import { IconRefresh, IconMapPin, IconUser, IconPhone, IconCar, IconPackage, IconClock, IconRoute } from '@tabler/icons-react';
+import { getAllDrivers } from '../../api/driverApi';
+import { buildApiUrl, getApiHeaders } from '../../api/config';
+
+const GOOGLE_MAPS_API_KEY = 'AIzaSyDG48YF2dsvPN0qHX3_vSaTJj6aqg3-Oc4';
+
+// Add pulse animation CSS
+const pulseAnimation = `
+  @keyframes pulse {
+    0%, 100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.7;
+    }
+  }
+`;
+
+// Inject animation into document
+if (typeof document !== 'undefined') {
+  const style = document.createElement('style');
+  style.textContent = pulseAnimation;
+  document.head.appendChild(style);
+}
+
+const LiveTracking = () => {
+  const [drivers, setDrivers] = useState([]);
+  const [filteredDrivers, setFilteredDrivers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [filterStatus, setFilterStatus] = useState('online');
+  const [stats, setStats] = useState({
+    total: 0,
+    online: 0,
+    offline: 0,
+    withOrders: 0
+  });
+  const mapRef = useRef(null);
+  const googleMapRef = useRef(null);
+  const markersRef = useRef([]);
+  const lastUpdateRef = useRef(null);
+
+  // Load Google Maps script
+  useEffect(() => {
+    const loadGoogleMaps = () => {
+      if (window.google) {
+        initializeMap();
+        return;
+      }
+
+      const script = document.createElement('script');
+      script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}`;
+      script.async = true;
+      script.defer = true;
+      script.onload = () => initializeMap();
+      script.onerror = () => setError('Failed to load Google Maps');
+      document.head.appendChild(script);
+    };
+
+    loadGoogleMaps();
+  }, []);
+
+  // Initialize Google Map
+  const initializeMap = () => {
+    if (!mapRef.current) return;
+
+    const map = new window.google.maps.Map(mapRef.current, {
+      center: { lat: 28.6139, lng: 77.209 }, // Default center (Delhi, India)
+      zoom: 12,
+      mapTypeControl: true,
+      streetViewControl: false,
+      fullscreenControl: true,
+      zoomControl: true
+    });
+
+    googleMapRef.current = map;
+    fetchDrivers();
+  };
+
+  // Fetch drivers from API
+  const fetchDrivers = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      const response = await getAllDrivers({ limit: 1000 });
+      console.log('📍 Fetched drivers for tracking:', response);
+
+      if (response && response.users) {
+        // Calculate statistics
+        const totalDrivers = response.users.length;
+        const onlineDrivers = response.users.filter((d) => d.isOnline || d.online || d.onlineStatus === 'online' || d.status === 'online');
+
+        console.log(`� Stats - Total: ${totalDrivers}, Online: ${onlineDrivers.length}`);
+
+        // Fetch ongoing orders for each online driver
+        const driversWithOrders = await Promise.all(
+          onlineDrivers.map(async (driver) => {
+            try {
+              const driverId = driver._id || driver.id;
+              const ongoingOrderUrl = buildApiUrl(`/ongoing-booking?riderId=${driverId}`);
+
+              const orderResponse = await fetch(ongoingOrderUrl, {
+                method: 'GET',
+                headers: getApiHeaders()
+              });
+
+              if (orderResponse.ok) {
+                const orderData = await orderResponse.json();
+                console.log(`📦 Order for driver ${driver.name}:`, orderData);
+
+                return {
+                  ...driver,
+                  currentOrder: orderData.booking || orderData
+                };
+              }
+            } catch (err) {
+              console.log(`⚠️ No order for driver ${driver.name || driver._id}`);
+            }
+
+            return {
+              ...driver,
+              currentOrder: null
+            };
+          })
+        );
+
+        const withOrders = driversWithOrders.filter((d) => d.currentOrder).length;
+
+        // Update statistics
+        setStats({
+          total: totalDrivers,
+          online: onlineDrivers.length,
+          offline: totalDrivers - onlineDrivers.length,
+          withOrders: withOrders
+        });
+
+        setDrivers(driversWithOrders);
+        setFilteredDrivers(driversWithOrders);
+        updateMapMarkers(driversWithOrders);
+        lastUpdateRef.current = new Date();
+      }
+    } catch (err) {
+      console.error('❌ Error fetching drivers:', err);
+      setError('Failed to load driver data');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Update map markers
+  const updateMapMarkers = (driverList) => {
+    if (!googleMapRef.current || !window.google) return;
+
+    // Clear existing markers
+    markersRef.current.forEach((marker) => marker.setMap(null));
+    markersRef.current = [];
+
+    const bounds = new window.google.maps.LatLngBounds();
+
+    driverList.forEach((driver) => {
+      const isOnline = driver.isOnline || driver.online || driver.onlineStatus === 'online';
+      const currentOrder = driver.currentOrder;
+
+      // Determine driver location priority:
+      // 1. Driver's real-time currentLocation from RiderSchema
+      // 2. Current order pickup location (if rider accepted order)
+      // 3. Driver's fallback location
+      let driverLat, driverLng, pickupLat, pickupLng, dropLat, dropLng;
+      let locationSource = null;
+
+      // PRIORITY 1: Get driver's real-time location from currentLocation field
+      if (driver.currentLocation && driver.currentLocation.coordinates) {
+        const coords = driver.currentLocation.coordinates;
+        if (Array.isArray(coords) && coords.length === 2) {
+          [driverLng, driverLat] = coords;
+          if (driverLat !== 0 && driverLng !== 0) {
+            locationSource = 'real-time';
+            console.log(`📍 Using real-time location for ${driver.name}:`, driverLat, driverLng);
+          }
+        }
+      }
+
+      // Fallback: Try other location formats
+      if (!driverLat || !driverLng || (driverLat === 0 && driverLng === 0)) {
+        if (driver.location?.coordinates) {
+          [driverLng, driverLat] = driver.location.coordinates;
+          if (driverLat !== 0 && driverLng !== 0) {
+            locationSource = 'location-field';
+          }
+        } else if (driver.latitude && driver.longitude) {
+          driverLat = driver.latitude;
+          driverLng = driver.longitude;
+          if (driverLat !== 0 && driverLng !== 0) {
+            locationSource = 'lat-lng-field';
+          }
+        }
+      }
+
+      // Check for order locations
+      if (currentOrder) {
+        // Get pickup location
+        if (currentOrder.from?.latitude && currentOrder.from?.longitude) {
+          pickupLat = currentOrder.from.latitude;
+          pickupLng = currentOrder.from.longitude;
+        } else if (currentOrder.fromAddress?.latitude && currentOrder.fromAddress?.longitude) {
+          pickupLat = currentOrder.fromAddress.latitude;
+          pickupLng = currentOrder.fromAddress.longitude;
+        }
+
+        // Get drop location
+        if (currentOrder.to?.latitude && currentOrder.to?.longitude) {
+          dropLat = currentOrder.to.latitude;
+          dropLng = currentOrder.to.longitude;
+        } else if (currentOrder.dropLocation?.[0]?.latitude && currentOrder.dropLocation?.[0]?.longitude) {
+          dropLat = currentOrder.dropLocation[0].latitude;
+          dropLng = currentOrder.dropLocation[0].longitude;
+        }
+      }
+
+      if (!driverLat || !driverLng) {
+        console.log(`⚠️ No location for driver ${driver.name || driver._id}`);
+        return;
+      }
+
+      const position = { lat: parseFloat(driverLat), lng: parseFloat(driverLng) };
+
+      // Create custom marker icon for driver with animation
+      const driverIcon = {
+        url:
+          'data:image/svg+xml;charset=UTF-8,' +
+          encodeURIComponent(`
+          <svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <filter id="glow">
+                <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+                <feMerge>
+                  <feMergeNode in="coloredBlur"/>
+                  <feMergeNode in="SourceGraphic"/>
+                </feMerge>
+              </filter>
+            </defs>
+            <circle cx="20" cy="20" r="18" fill="${isOnline ? '#4CAF50' : '#9E9E9E'}" opacity="0.3"/>
+            <circle cx="20" cy="20" r="12" fill="${isOnline ? '#4CAF50' : '#9E9E9E'}" stroke="white" stroke-width="3" filter="url(#glow)"/>
+            <path d="M20 12 L20 20 L25 20" stroke="white" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        `),
+        scaledSize: new window.google.maps.Size(40, 40),
+        anchor: new window.google.maps.Point(20, 20)
+      };
+
+      const driverMarker = new window.google.maps.Marker({
+        position,
+        map: googleMapRef.current,
+        title: driver.name || driver.fullName || 'Driver',
+        icon: driverIcon,
+        animation: window.google.maps.Animation.DROP,
+        zIndex: 100
+      });
+
+      // Create info window for driver
+      const lastUpdate = driver.lastLocationUpdate || driver.lastSeen || driver.updatedAt;
+      const orderInfo = currentOrder
+        ? `
+        <div style="background: #f5f5f5; padding: 8px; border-radius: 4px; margin-top: 8px;">
+          <p style="margin: 4px 0; font-size: 12px; font-weight: 600; color: #2196F3;">📦 Active Order</p>
+          <p style="margin: 4px 0; font-size: 12px;"><strong>ID:</strong> ${currentOrder.bookingId || currentOrder._id?.slice(-6) || 'N/A'}</p>
+          <p style="margin: 4px 0; font-size: 12px;"><strong>Pickup:</strong> ${(currentOrder.from?.address || currentOrder.fromAddress?.address || 'N/A').substring(0, 40)}...</p>
+          <p style="margin: 4px 0; font-size: 12px;"><strong>Drop:</strong> ${(currentOrder.to?.Address || currentOrder.dropLocation?.[0]?.Address || 'N/A').substring(0, 40)}...</p>
+          <p style="margin: 4px 0; font-size: 12px;"><strong>Status:</strong> <span style="color: #2196F3; font-weight: bold;">${currentOrder.status || currentOrder.bookingStatus || 'N/A'}</span></p>
+        </div>
+      `
+        : '<p style="margin: 4px 0; font-size: 12px; color: #9E9E9E; font-style: italic;">No active order</p>';
+
+      const driverInfoWindow = new window.google.maps.InfoWindow({
+        content: `
+          <div style="padding: 10px; font-family: 'Roboto', sans-serif; min-width: 280px;">
+            <h3 style="margin: 0 0 10px 0; color: #EC4D4A; font-size: 16px; display: flex; align-items: center; gap: 6px;">
+              🚗 ${driver.name || driver.fullName || 'Driver'}
+              <span style="background: ${isOnline ? '#4CAF50' : '#9E9E9E'}; width: 8px; height: 8px; border-radius: 50%; display: inline-block;"></span>
+            </h3>
+            <div style="background: #fafafa; padding: 8px; border-radius: 4px; margin-bottom: 8px;">
+              <p style="margin: 4px 0; font-size: 12px;"><strong>📞 Phone:</strong> ${driver.phone || driver.mobile || 'N/A'}</p>
+              <p style="margin: 4px 0; font-size: 12px;"><strong>🚙 Vehicle:</strong> ${driver.vehicleType || 'N/A'} ${driver.vehicleSubType ? `(${driver.vehicleSubType})` : ''}</p>
+              <p style="margin: 4px 0; font-size: 12px;"><strong>📍 Location:</strong> <span style="color: #4CAF50; font-weight: 600;">${locationSource || 'N/A'}</span></p>
+              ${lastUpdate ? `<p style="margin: 4px 0; font-size: 11px; color: #666;"><strong>🕐 Last Update:</strong> ${new Date(lastUpdate).toLocaleTimeString()}</p>` : ''}
+            </div>
+            ${orderInfo}
+          </div>
+        `
+      });
+
+      driverMarker.addListener('click', () => {
+        markersRef.current.forEach((m) => m.infoWindow?.close());
+        driverInfoWindow.open(googleMapRef.current, driverMarker);
+      });
+
+      driverMarker.infoWindow = driverInfoWindow;
+      markersRef.current.push(driverMarker);
+      bounds.extend(position);
+
+      // Add pickup marker if different from driver location
+      if (pickupLat && pickupLng && orderLocation !== 'pickup') {
+        const pickupPosition = { lat: parseFloat(pickupLat), lng: parseFloat(pickupLng) };
+        const pickupIcon = {
+          url:
+            'data:image/svg+xml;charset=UTF-8,' +
+            encodeURIComponent(`
+            <svg width="32" height="40" viewBox="0 0 32 40" xmlns="http://www.w3.org/2000/svg">
+              <path d="M16 0C7.2 0 0 7.2 0 16c0 8.8 16 24 16 24s16-15.2 16-24C32 7.2 24.8 0 16 0z" fill="#2196F3"/>
+              <circle cx="16" cy="16" r="6" fill="white"/>
+            </svg>
+          `),
+          scaledSize: new window.google.maps.Size(32, 40),
+          anchor: new window.google.maps.Point(16, 40)
+        };
+
+        const pickupMarker = new window.google.maps.Marker({
+          position: pickupPosition,
+          map: googleMapRef.current,
+          title: 'Pickup Location',
+          icon: pickupIcon,
+          zIndex: 50
+        });
+
+        const pickupInfoWindow = new window.google.maps.InfoWindow({
+          content: `
+            <div style="padding: 8px; font-family: 'Roboto', sans-serif;">
+              <h4 style="margin: 0 0 8px 0; color: #2196F3; font-size: 14px;">📍 Pickup Location</h4>
+              <p style="margin: 4px 0; font-size: 12px;">${currentOrder.from?.address || currentOrder.fromAddress?.address || 'Pickup Address'}</p>
+              <p style="margin: 4px 0; font-size: 12px;"><strong>Driver:</strong> ${driver.name || 'N/A'}</p>
+            </div>
+          `
+        });
+
+        pickupMarker.addListener('click', () => {
+          markersRef.current.forEach((m) => m.infoWindow?.close());
+          pickupInfoWindow.open(googleMapRef.current, pickupMarker);
+        });
+
+        pickupMarker.infoWindow = pickupInfoWindow;
+        markersRef.current.push(pickupMarker);
+        bounds.extend(pickupPosition);
+      }
+
+      // Add drop marker if available
+      if (dropLat && dropLng) {
+        const dropPosition = { lat: parseFloat(dropLat), lng: parseFloat(dropLng) };
+        const dropIcon = {
+          url:
+            'data:image/svg+xml;charset=UTF-8,' +
+            encodeURIComponent(`
+            <svg width="32" height="40" viewBox="0 0 32 40" xmlns="http://www.w3.org/2000/svg">
+              <path d="M16 0C7.2 0 0 7.2 0 16c0 8.8 16 24 16 24s16-15.2 16-24C32 7.2 24.8 0 16 0z" fill="#EC4D4A"/>
+              <circle cx="16" cy="16" r="6" fill="white"/>
+            </svg>
+          `),
+          scaledSize: new window.google.maps.Size(32, 40),
+          anchor: new window.google.maps.Point(16, 40)
+        };
+
+        const dropMarker = new window.google.maps.Marker({
+          position: dropPosition,
+          map: googleMapRef.current,
+          title: 'Drop Location',
+          icon: dropIcon,
+          zIndex: 50
+        });
+
+        const dropInfoWindow = new window.google.maps.InfoWindow({
+          content: `
+            <div style="padding: 8px; font-family: 'Roboto', sans-serif;">
+              <h4 style="margin: 0 0 8px 0; color: #EC4D4A; font-size: 14px;">📍 Drop Location</h4>
+              <p style="margin: 4px 0; font-size: 12px;">${currentOrder.to?.Address || currentOrder.dropLocation?.[0]?.Address || 'Drop Address'}</p>
+              <p style="margin: 4px 0; font-size: 12px;"><strong>Driver:</strong> ${driver.name || 'N/A'}</p>
+            </div>
+          `
+        });
+
+        dropMarker.addListener('click', () => {
+          markersRef.current.forEach((m) => m.infoWindow?.close());
+          dropInfoWindow.open(googleMapRef.current, dropMarker);
+        });
+
+        dropMarker.infoWindow = dropInfoWindow;
+        markersRef.current.push(dropMarker);
+        bounds.extend(dropPosition);
+      }
+
+      // Draw route if both pickup and drop exist
+      if (pickupLat && pickupLng && dropLat && dropLng) {
+        const routePath = [
+          { lat: parseFloat(pickupLat), lng: parseFloat(pickupLng) },
+          { lat: parseFloat(dropLat), lng: parseFloat(dropLng) }
+        ];
+
+        const routeLine = new window.google.maps.Polyline({
+          path: routePath,
+          geodesic: true,
+          strokeColor: '#2196F3',
+          strokeOpacity: 0.6,
+          strokeWeight: 3,
+          map: googleMapRef.current
+        });
+
+        markersRef.current.push({ setMap: (map) => routeLine.setMap(map) });
+      }
+    });
+
+    // Fit map to show all markers
+    if (driverList.length > 0 && markersRef.current.length > 0) {
+      googleMapRef.current.fitBounds(bounds);
+      // Prevent too much zoom for single marker
+      const listener = window.google.maps.event.addListener(googleMapRef.current, 'idle', () => {
+        if (googleMapRef.current.getZoom() > 15) googleMapRef.current.setZoom(15);
+        window.google.maps.event.removeListener(listener);
+      });
+    }
+  };
+
+  // Filter drivers by status
+  useEffect(() => {
+    if (filterStatus === 'all') {
+      setFilteredDrivers(drivers);
+      updateMapMarkers(drivers);
+    } else if (filterStatus === 'online') {
+      const online = drivers.filter((d) => d.isOnline || d.online || d.onlineStatus === 'online');
+      setFilteredDrivers(online);
+      updateMapMarkers(online);
+    } else if (filterStatus === 'offline') {
+      const offline = drivers.filter((d) => !d.isOnline && !d.online && d.onlineStatus !== 'online');
+      setFilteredDrivers(offline);
+      updateMapMarkers(offline);
+    }
+  }, [filterStatus, drivers]);
+
+  // Auto-refresh every 15 seconds for real-time updates
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!loading) {
+        console.log('🔄 Auto-refreshing driver locations...');
+        fetchDrivers();
+      }
+    }, 15000); // Refresh every 15 seconds for real-time tracking
+
+    return () => clearInterval(interval);
+  }, [loading]);
+
+  const handleRefresh = () => {
+    fetchDrivers();
+  };
+
+  const getDriverName = (driver) => {
+    if (driver.fullName) return driver.fullName;
+    if (driver.name && driver.lname) return `${driver.name} ${driver.lname}`;
+    if (driver.name) return driver.name;
+    return 'Unknown Driver';
+  };
+
+  return (
+    <Box sx={{ position: 'relative', height: '100vh', width: '100%', overflow: 'hidden' }}>
+      {/* Full Page Map */}
+      <Box
+        ref={mapRef}
+        sx={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          width: '100%',
+          height: '100%'
+        }}
+      />
+
+      {/* Floating Header */}
+      <Box
+        sx={{
+          position: 'absolute',
+          top: 16,
+          left: 16,
+          right: 400,
+          zIndex: 1000,
+          display: 'flex',
+          gap: 2
+        }}
+      >
+        {/* Statistics Cards */}
+        <Paper elevation={3} sx={{ flex: 1, p: 2, borderRadius: 2, bgcolor: 'rgba(255,255,255,0.95)', backdropFilter: 'blur(10px)' }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <Avatar sx={{ bgcolor: '#667eea', width: 48, height: 48 }}>
+              <IconUser size={24} />
+            </Avatar>
+            <Box>
+              <Typography variant="h5" sx={{ fontWeight: 700, color: '#667eea' }}>
+                {stats.total}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Total Drivers
+              </Typography>
+            </Box>
+          </Box>
+        </Paper>
+
+        <Paper elevation={3} sx={{ flex: 1, p: 2, borderRadius: 2, bgcolor: 'rgba(255,255,255,0.95)', backdropFilter: 'blur(10px)' }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <Avatar sx={{ bgcolor: '#4CAF50', width: 48, height: 48 }}>
+              <IconMapPin size={24} />
+            </Avatar>
+            <Box>
+              <Typography variant="h5" sx={{ fontWeight: 700, color: '#4CAF50' }}>
+                {stats.online}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Online Now
+              </Typography>
+            </Box>
+          </Box>
+        </Paper>
+
+        <Paper elevation={3} sx={{ flex: 1, p: 2, borderRadius: 2, bgcolor: 'rgba(255,255,255,0.95)', backdropFilter: 'blur(10px)' }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <Avatar sx={{ bgcolor: '#2196F3', width: 48, height: 48 }}>
+              <IconPackage size={24} />
+            </Avatar>
+            <Box>
+              <Typography variant="h5" sx={{ fontWeight: 700, color: '#2196F3' }}>
+                {stats.withOrders}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Active Orders
+              </Typography>
+            </Box>
+          </Box>
+        </Paper>
+      </Box>
+
+      {/* Floating Control Panel */}
+      <Paper
+        elevation={3}
+        sx={{
+          position: 'absolute',
+          top: 100,
+          left: 16,
+          zIndex: 1000,
+          p: 1.5,
+          borderRadius: 2,
+          bgcolor: 'rgba(255,255,255,0.95)',
+          backdropFilter: 'blur(10px)',
+          display: 'flex',
+          gap: 1,
+          alignItems: 'center'
+        }}
+      >
+        <TextField
+          select
+          size="small"
+          value={filterStatus}
+          onChange={(e) => setFilterStatus(e.target.value)}
+          sx={{ minWidth: 140 }}
+        >
+          <MenuItem value="all">All Drivers</MenuItem>
+          <MenuItem value="online">🟢 Online Only</MenuItem>
+          <MenuItem value="offline">⚫ Offline Only</MenuItem>
+        </TextField>
+
+        <Chip label={loading ? 'Updating...' : 'Live'} color={loading ? 'default' : 'success'} size="small" sx={{ fontWeight: 600 }} />
+
+        <Tooltip title="Refresh Now">
+          <IconButton onClick={handleRefresh} disabled={loading} sx={{ bgcolor: '#EC4D4A', color: 'white', '&:hover': { bgcolor: '#d43d3a' } }}>
+            <IconRefresh size={20} />
+          </IconButton>
+        </Tooltip>
+      </Paper>
+
+      {/* Map Legend */}
+      <Paper
+        elevation={3}
+        sx={{
+          position: 'absolute',
+          bottom: 16,
+          left: 16,
+          zIndex: 1000,
+          p: 1.5,
+          borderRadius: 2,
+          bgcolor: 'rgba(255,255,255,0.95)',
+          backdropFilter: 'blur(10px)',
+          display: 'flex',
+          gap: 2,
+          flexWrap: 'wrap'
+        }}
+      >
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Box sx={{ width: 14, height: 14, borderRadius: '50%', bgcolor: '#4CAF50', border: '2px solid white', boxShadow: 1 }} />
+          <Typography variant="caption" fontWeight={500}>
+            Online Driver
+          </Typography>
+        </Box>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Box sx={{ width: 0, height: 0, borderLeft: '6px solid transparent', borderRight: '6px solid transparent', borderBottom: '12px solid #2196F3' }} />
+          <Typography variant="caption" fontWeight={500}>
+            Pickup
+          </Typography>
+        </Box>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Box sx={{ width: 0, height: 0, borderLeft: '6px solid transparent', borderRight: '6px solid transparent', borderBottom: '12px solid #EC4D4A' }} />
+          <Typography variant="caption" fontWeight={500}>
+            Drop
+          </Typography>
+        </Box>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Box sx={{ width: 20, height: 2, bgcolor: '#2196F3', opacity: 0.6 }} />
+          <Typography variant="caption" fontWeight={500}>
+            Route
+          </Typography>
+        </Box>
+      </Paper>
+
+      {/* Floating Driver List Sidebar */}
+      <Paper
+        elevation={3}
+        sx={{
+          position: 'absolute',
+          top: 16,
+          right: 16,
+          bottom: 16,
+          width: 380,
+          zIndex: 1000,
+          borderRadius: 3,
+          bgcolor: 'rgba(255,255,255,0.98)',
+          backdropFilter: 'blur(10px)',
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden'
+        }}
+      >
+        {/* Sidebar Header */}
+        <Box sx={{ p: 2.5, borderBottom: '1px solid #e0e0e0', bgcolor: '#EC4D4A' }}>
+          <Typography variant="h5" sx={{ color: 'white', fontWeight: 700, mb: 0.5, display: 'flex', alignItems: 'center', gap: 1 }}>
+            <IconMapPin size={24} />
+            Live Tracking
+          </Typography>
+          <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.9)' }}>
+            {filteredDrivers.length} driver{filteredDrivers.length !== 1 ? 's' : ''} • {lastUpdateRef.current && lastUpdateRef.current.toLocaleTimeString()}
+          </Typography>
+        </Box>
+
+        {error && (
+          <Alert severity="error" sx={{ m: 2, borderRadius: 2 }}>
+            {error}
+          </Alert>
+        )}
+
+        {/* Driver List */}
+        <Box sx={{ flex: 1, overflow: 'auto', p: 2 }}>
+                sx={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  p: 2.5,
+                  bgcolor: 'white',
+                  borderBottom: '1px solid #e0e0e0'
+                }}
+              >
+                <Box>
+                  <Typography variant="h5" sx={{ color: '#EC4D4A', fontWeight: 600 }}>
+                    📍 Live Map View
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Showing {filteredDrivers.length} driver{filteredDrivers.length !== 1 ? 's' : ''} on map
+                  </Typography>
+                </Box>
+                <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center' }}>
+                  <TextField
+                    select
+                    size="small"
+                    value={filterStatus}
+                    onChange={(e) => setFilterStatus(e.target.value)}
+                    sx={{
+                      minWidth: 130,
+                      '& .MuiOutlinedInput-root': {
+                        borderRadius: 2
+                      }
+                    }}
+                  >
+                    <MenuItem value="all">All Drivers</MenuItem>
+                    <MenuItem value="online">🟢 Online Only</MenuItem>
+                    <MenuItem value="offline">⚫ Offline Only</MenuItem>
+                  </TextField>
+                  <Chip
+                    label={loading ? 'Updating...' : 'Live'}
+                    color={loading ? 'default' : 'success'}
+                    size="small"
+                    sx={{ fontWeight: 600, animation: loading ? 'none' : 'pulse 2s infinite' }}
+                  />
+                </Box>
+              </Box>
+
+              {loading && drivers.length === 0 ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: 600, bgcolor: '#fafafa' }}>
+                  <Box sx={{ textAlign: 'center' }}>
+                    <CircularProgress size={60} thickness={4} sx={{ color: '#EC4D4A' }} />
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
+                      Loading driver locations...
+                    </Typography>
+                  </Box>
+                </Box>
+              ) : (
+                <Box
+                  ref={mapRef}
+                  sx={{
+                    width: '100%',
+                    height: 600,
+                    bgcolor: '#e0e0e0',
+                    position: 'relative'
+                  }}
+                />
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Map Legend */}
+          <Paper
+            elevation={0}
+            sx={{
+              mt: 2,
+              p: 2,
+              borderRadius: 2,
+              border: '1px solid #e0e0e0',
+              display: 'flex',
+              gap: 3,
+              flexWrap: 'wrap',
+              justifyContent: 'center'
+            }}
+          >
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Box
+                sx={{
+                  width: 16,
+                  height: 16,
+                  borderRadius: '50%',
+                  bgcolor: '#4CAF50',
+                  border: '2px solid white',
+                  boxShadow: 1
+                }}
+              />
+              <Typography variant="caption" fontWeight={500}>
+                Online Driver
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Box
+                sx={{
+                  width: 0,
+                  height: 0,
+                  borderLeft: '8px solid transparent',
+                  borderRight: '8px solid transparent',
+                  borderBottom: '16px solid #2196F3'
+                }}
+              />
+              <Typography variant="caption" fontWeight={500}>
+                Pickup Location
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Box
+                sx={{
+                  width: 0,
+                  height: 0,
+                  borderLeft: '8px solid transparent',
+                  borderRight: '8px solid transparent',
+                  borderBottom: '16px solid #EC4D4A'
+                }}
+              />
+              <Typography variant="caption" fontWeight={500}>
+                Drop Location
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Box sx={{ width: 24, height: 3, bgcolor: '#2196F3', opacity: 0.6 }} />
+              <Typography variant="caption" fontWeight={500}>
+                Route Path
+              </Typography>
+            </Box>
+          </Paper>
+        </Grid>
+
+        {/* Driver List Section */}
+        <Grid item xs={12} lg={4}>
+          <Card elevation={0} sx={{ borderRadius: 3, height: '100%', maxHeight: 730 }}>
+            <CardContent sx={{ p: 0, height: '100%', display: 'flex', flexDirection: 'column' }}>
+              <Box sx={{ p: 2.5, borderBottom: '1px solid #e0e0e0' }}>
+                <Typography variant="h5" sx={{ color: '#EC4D4A', fontWeight: 600, mb: 0.5 }}>
+                  🚗 Active Drivers
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {filteredDrivers.length} driver{filteredDrivers.length !== 1 ? 's' : ''} currently tracked
+                </Typography>
+              </Box>
+
+              <Box sx={{ flex: 1, overflow: 'auto', p: 2 }}>
+                {loading && drivers.length === 0 ? (
+                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}>
+                    <CircularProgress />
+                  </Box>
+                ) : filteredDrivers.length === 0 ? (
+                  <Alert severity="info" sx={{ borderRadius: 2 }}>
+                    No {filterStatus} drivers found
+                  </Alert>
+                ) : (
+                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    {filteredDrivers.map((driver, index) => {
+                      const isOnline = driver.isOnline || driver.online || driver.onlineStatus === 'online';
+                      const currentOrder = driver.currentOrder;
+                      const lastUpdate = driver.lastLocationUpdate || driver.lastSeen;
+
+                      return (
+                        <Card
+                          key={driver._id || driver.id}
+                          variant="outlined"
+                          sx={{
+                            borderRadius: 2,
+                            borderLeft: `4px solid ${isOnline ? '#4CAF50' : '#9E9E9E'}`,
+                            transition: 'all 0.3s ease',
+                            '&:hover': {
+                              boxShadow: 3,
+                              transform: 'translateY(-2px)',
+                              cursor: 'pointer',
+                              borderColor: '#EC4D4A'
+                            }
+                          }}
+                          onClick={() => {
+                            // Center map on driver's location
+                            let lat, lng;
+
+                            // Get driver's real-time location
+                            if (driver.currentLocation?.coordinates) {
+                              [lng, lat] = driver.currentLocation.coordinates;
+                            } else if (currentOrder?.from) {
+                              lat = currentOrder.from.latitude;
+                              lng = currentOrder.from.longitude;
+                            } else if (driver.location?.coordinates) {
+                              [lng, lat] = driver.location.coordinates;
+                            } else if (driver.latitude && driver.longitude) {
+                              lat = driver.latitude;
+                              lng = driver.longitude;
+                            }
+
+                            if (lat && lng && googleMapRef.current) {
+                              googleMapRef.current.setCenter({ lat: parseFloat(lat), lng: parseFloat(lng) });
+                              googleMapRef.current.setZoom(16);
+                            }
+                          }}
+                        >
+                          <CardContent sx={{ p: 2 }}>
+                            <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5 }}>
+                              <Badge
+                                overlap="circular"
+                                anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+                                badgeContent={
+                                  <Box
+                                    sx={{
+                                      width: 12,
+                                      height: 12,
+                                      borderRadius: '50%',
+                                      bgcolor: isOnline ? '#4CAF50' : '#9E9E9E',
+                                      border: '2px solid white'
+                                    }}
+                                  />
+                                }
+                              >
+                                <Avatar
+                                  sx={{
+                                    bgcolor: isOnline ? '#4CAF50' : '#9E9E9E',
+                                    width: 48,
+                                    height: 48,
+                                    fontSize: '1.2rem'
+                                  }}
+                                >
+                                  {(driver.name || 'D').charAt(0).toUpperCase()}
+                                </Avatar>
+                              </Badge>
+
+                              <Box sx={{ flex: 1, minWidth: 0 }}>
+                                <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 0.5, lineHeight: 1.3 }}>
+                                  {getDriverName(driver)}
+                                </Typography>
+
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.3 }}>
+                                  <IconPhone size={12} style={{ color: '#666' }} />
+                                  <Typography variant="caption" color="text.secondary">
+                                    {driver.phone || driver.mobile || 'N/A'}
+                                  </Typography>
+                                </Box>
+
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.8 }}>
+                                  <IconCar size={12} style={{ color: '#666' }} />
+                                  <Typography variant="caption" color="text.secondary">
+                                    {driver.vehicleType || 'N/A'}
+                                    {driver.vehicleSubType && ` - ${driver.vehicleSubType}`}
+                                  </Typography>
+                                </Box>
+
+                                {currentOrder && (
+                                  <Box
+                                    sx={{
+                                      mt: 1,
+                                      p: 1,
+                                      bgcolor: '#E3F2FD',
+                                      borderRadius: 1,
+                                      borderLeft: '3px solid #2196F3'
+                                    }}
+                                  >
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.3 }}>
+                                      <IconPackage size={12} color="#2196F3" />
+                                      <Typography variant="caption" sx={{ fontWeight: 600, color: '#2196F3' }}>
+                                        Order #{currentOrder.bookingId || currentOrder._id?.slice(-6)}
+                                      </Typography>
+                                    </Box>
+                                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', fontSize: '0.65rem' }}>
+                                      {currentOrder.status || currentOrder.bookingStatus || 'Active'}
+                                    </Typography>
+                                  </Box>
+                                )}
+
+                                {lastUpdate && (
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 1 }}>
+                                    <IconClock size={11} style={{ color: '#999' }} />
+                                    <Typography variant="caption" sx={{ fontSize: '0.65rem', color: '#999' }}>
+                                      {new Date(lastUpdate).toLocaleTimeString()}
+                                    </Typography>
+                                  </Box>
+                                )}
+
+                                <Box sx={{ mt: 1, display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                                  <Chip
+                                    label={isOnline ? 'Online' : 'Offline'}
+                                    size="small"
+                                    sx={{
+                                      height: 20,
+                                      fontSize: '0.65rem',
+                                      bgcolor: isOnline ? '#4CAF50' : '#9E9E9E',
+                                      color: 'white',
+                                      fontWeight: 600
+                                    }}
+                                  />
+                                  {currentOrder && (
+                                    <Chip
+                                      label="Active Order"
+                                      size="small"
+                                      sx={{
+                                        height: 20,
+                                        fontSize: '0.65rem',
+                                        bgcolor: '#2196F3',
+                                        color: 'white',
+                                        fontWeight: 600
+                                      }}
+                                    />
+                                  )}
+                                </Box>
+                              </Box>
+                            </Box>
+                          </CardContent>
+                        </Card>
+                      );
+                    })}
+                  </Box>
+                )}
+              </Box>
+            </CardContent>
+          </Card>
+        </Grid>
+      </Grid>
+    </Box>
+  );
+};
+
+export default LiveTracking;
