@@ -44,7 +44,7 @@ import DialogContent from '@mui/material/DialogContent';
 import DialogActions from '@mui/material/DialogActions';
 import axios from 'axios';
 
-const API_BASE_URL = 'http://localhost:3001/api/v1/dynamic-pricing';
+const API_BASE_URL = 'https://ridodrop-backend-24-10-2025.onrender.com/api/v1/dynamic-pricing';
 
 const vehicleIcons = {
   '2W': <DirectionsBikeIcon />,
