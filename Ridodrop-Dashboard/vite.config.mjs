@@ -17,7 +17,7 @@ export default defineConfig(({ mode }) => {
       host: true
     },
     build: {
-      outDir: 'build',
+      outDir: 'dist',
       chunkSizeWarningLimit: 1600
     },
     preview: {
